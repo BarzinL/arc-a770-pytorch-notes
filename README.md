@@ -55,6 +55,14 @@ import xpu_reductions
 xpu_reductions.install()   # once, before training
 ```
 
+Correction (2026-11-04): the first published version of `xpu_reductions.py` sent reductions
+over trailing dimensions to the stock kernel below the autograd key with no backward, so
+`sum(-1)`, `mean(-1)` and reductions over the whole tensor returned the right values but no
+gradient, and training through them silently lost part of its gradient. The current version
+wraps that call in an autograd function with the gradients sum and mean have, and the script
+now also checks gradients of every reduction form against the CPU. If you copied the earlier
+version, replace it.
+
 Running `python xpu_reductions.py` measures the stock kernels and
 `python xpu_reductions.py --installed` the replacement. Sum and mean take turns as the first
 reduction after each upload, 15 trials each; the bias gradient is checked 30 times:
@@ -65,8 +73,9 @@ reduction after each upload, 15 trials each; the bias gradient is checked 30 tim
 | 2.16.0.dev20261102+xpu | 8, 4, 18 wrong | 0, 0, 0 |
 
 In a recurrent model's training run, the steps with a wrong on-card bias sum went from 13 and
-14 of 60 (worst 11,561 times off) to 0 of 80, the gradient-norm spikes stopped, and a training
-step took 2.66 s against 2.70 s before. `amax` and `amin` over leading dimensions are not
+14 of 60 (worst 11,561 times off) to 0 of 80 and the gradient-norm spikes stopped. With the
+corrected version, every gradient of a training step equals the CPU's to within 6e-6 relative,
+and a step takes 2.69 s against 2.70 s before. `amax` and `amin` over leading dimensions are not
 covered; replace them the same way if your model uses them.
 
 ## 2. `clip_grad_norm_` overcounts the gradient norm

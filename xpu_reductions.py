@@ -35,19 +35,45 @@ def _sum_by_product(x, dims, keepdim, dtype):
     return out, n
 
 
+class _Stock(torch.autograd.Function):
+    """The stock kernel, called below the autograd key (calling it at the key would reach
+    these replacements again), with the gradient that sum and mean have. Without this
+    wrapper the result carries no gradient: every trailing reduction would return the right
+    value and silently cut training's gradient."""
+
+    @staticmethod
+    def forward(ctx, x, dim, dims, keepdim, dtype, mean):
+        ctx.shape, ctx.dims, ctx.keepdim, ctx.in_dtype, ctx.mean = x.shape, dims, keepdim, x.dtype, mean
+        with torch._C._AutoDispatchBelowAutograd():
+            if mean:
+                return torch.ops.aten.mean.dim(x, dim, keepdim, dtype=dtype)
+            return torch.ops.aten.sum.dim_IntList(x, dim, keepdim, dtype=dtype)
+
+    @staticmethod
+    def backward(ctx, grad):
+        if not ctx.keepdim:
+            for d in ctx.dims:
+                grad = grad.unsqueeze(d)
+        grad = grad.expand(ctx.shape)
+        if ctx.mean:
+            n = 1
+            for d in ctx.dims:
+                n *= ctx.shape[d]
+            grad = grad / n
+        return grad.to(ctx.in_dtype), None, None, None, None, None
+
+
 def _sum(x, dim=None, keepdim=False, dtype=None):
     dims = _reduced(x, dim)
     if _stock(x, dims):
-        with torch._C._AutoDispatchBelowAutograd():
-            return torch.ops.aten.sum.dim_IntList(x, dim, keepdim, dtype=dtype)
+        return _Stock.apply(x, dim, dims, keepdim, dtype, False)
     return _sum_by_product(x, dims, keepdim, dtype)[0]
 
 
 def _mean(x, dim=None, keepdim=False, dtype=None):
     dims = _reduced(x, dim)
     if _stock(x, dims):
-        with torch._C._AutoDispatchBelowAutograd():
-            return torch.ops.aten.mean.dim(x, dim, keepdim, dtype=dtype)
+        return _Stock.apply(x, dim, dims, keepdim, dtype, True)
     total, n = _sum_by_product(x, dims, keepdim, dtype)
     return total / n
 
@@ -80,3 +106,17 @@ if __name__ == "__main__":
         want = g.double().sum(0)
         wrong["bias gradient"] += ((lin.bias.grad.cpu().double() - want).norm() / want.norm()).item() > 1e-4
     print(f"torch {torch.__version__}, workaround {'installed' if _library else 'not installed'}: wrong {wrong} (sum and mean of 15 each, bias gradient of 30)")
+    # Gradients through every form of reduction must match the CPU's.
+    bad = []
+    for op in ("sum", "mean"):
+        for dim in ([0], [-1], [1, 2], None):
+            x = torch.randn(64, 32, 16)
+            w = torch.randn_like(getattr(x, op)(dim))
+            grads = []
+            for dev in ("cpu", "xpu"):
+                t = x.detach().clone().to(dev).requires_grad_()
+                (getattr(t, op)(dim) * w.to(dev)).sum().backward()
+                grads.append(None if t.grad is None else t.grad.cpu())
+            if grads[1] is None or not torch.allclose(grads[0], grads[1], atol=1e-5):
+                bad.append(f"{op}({dim})")
+    print("gradients that differ from the CPU's:", bad or "none")
