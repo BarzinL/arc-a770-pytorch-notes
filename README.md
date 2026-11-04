@@ -81,10 +81,14 @@ norm is too large. `foreach_norm_repro.py` compares it with norms taken one tens
 | 9 | 5070.5 | 7170.3 | 5066.0 |
 | 108 | 17566.0 | 24844.8 | 17550.4 |
 
-For the 9 tensors the ratio is the square root of 2 to four digits. For a real model's
+Taken tensor by tensor, every result is wrong: about 1.414 (the square root of 2) times too large
+for tensors of tens of thousands to millions of elements, exactly 2 times for tensors of 1 and
+64 elements, and 1.64 times for one of 3,072, every time, with a single tensor in the list as well as with many. For a real model's
 gradients the logged norm was 23.1 where the true norm was 15.5. The same script on a CUDA card
 (an RTX 3060 Ti) gives agreeing norms, so the defect is specific to the XPU kernel. It is
 present with or without the graph-capture settings below.
+
+Reported upstream as [intel/torch-xpu-ops#6035](https://github.com/intel/torch-xpu-ops/issues/6035).
 
 ### Workaround
 
