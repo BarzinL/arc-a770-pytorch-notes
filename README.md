@@ -1,9 +1,10 @@
-# Training on an Intel Arc A770 with PyTorch XPU: two wrong-result bugs and graph capture
+# Training on an Intel Arc A770 with PyTorch XPU: two wrong-result bugs, graph capture, and the cost of allocations
 
 These notes come from training recurrent models on an Arc A770 (16 GB) with PyTorch's XPU
 backend. Two bugs give silently wrong gradients in ordinary training code. Neither raises an
 error or a warning, and each has a workaround of a few lines. The third section shows how to
-turn on graph capture (`torch.xpu.XPUGraph`), which the card refuses by default.
+turn on graph capture (`torch.xpu.XPUGraph`), which the card refuses by default. The fourth
+shows that every device allocation a process holds makes each eager operation slower.
 
 Measured on torch 2.15.0+xpu and the 2.16.0.dev20261102+xpu nightly, intel-compute-runtime
 26.35.39758, Linux 7.2. Every number below comes from the scripts in this folder, run on that
@@ -151,6 +152,53 @@ Caveats:
   CUDA graphs; they have to run outside the recorded region.
 - The two bugs above happen with or without capture.
 
+## 4. Every allocation held makes each eager operation slower
+
+The host time of an eager operation grows with the number of device allocations the process
+holds, not with the amount of memory. `allocation_cost.py` times an eager `nn.GRUCell` loop
+(width 512, batch 32) while holding a number of 1 MiB tensors, which PyTorch's caching
+allocator places two to a 2 MiB segment, so each pair is one device allocation; then the same
+bytes in one tensor:
+
+| Extra memory held | Allocator segments | Eager, microseconds per step | Replay, microseconds per step |
+|---|---|---|---|
+| none | 3-4 | 167-191 | 21 |
+| 250 tensors of 1 MiB | 127-129 | 300-318 | 21 |
+| 500 | 252-254 | 437-457 | 21 |
+| 1,000 | 502-504 | 740-758 | 37 |
+| 2,000 | 1,002-1,004 | 1,484-1,494 | 35 |
+| 4,000 | 2,002-2,004 | 3,325-3,329 | 39 |
+| 3.91 GiB in one tensor | 3-5 | 171-189 | 21 |
+
+The ranges span two runs: the default runtime, and the settings of section 3 (the replay column
+is from that run only). Each step costs about 1.1 microseconds more per extra allocation at
+first and about 1.6 at 2,000. A recorded graph's replay grows far less, from 21 to 39
+microseconds.
+
+- `expandable_segments:True` in `PYTORCH_ALLOC_CONF` does not help: the same tensors cost the
+  same (169 rising to 3,241 microseconds per step), and 3.91 GiB in one tensor cost 363
+  microseconds per step instead of 171, presumably because the allocator builds it from many
+  physical chunks. With this setting PyTorch reports no segment count.
+- Why each allocation costs every operation was not measured. The card runs on the `i915`
+  kernel driver here. One possibility is that the runtime passes every allocation to the
+  driver at each submission.
+
+In a training job this is easy to hit, because a real model's working memory is spread over
+hundreds of segments. A recurrent model whose training step dispatches about 36,000 eager
+operations held about 510 segments and took 2.8 s per step; recording a second part of it with
+its own `make_graphed_callables` call added about 270 segments (each call gets a private memory
+pool) and made the step 1.4 s slower, about 5 ms per segment. Recording both parts in one call,
+which gives them one shared pool, cut the extra segments to about 70 and the step to 3.2 s:
+
+```python
+# one pool for both recordings; replay them in this order, backward in reverse
+first, second = torch.xpu.make_graphed_callables((first, second), (first_args, second_args))
+```
+
+Two practical consequences: keep the number of live allocations low (few large tensors rather
+than many small ones, one shared pool for all recordings), and expect eager timings on this card
+to depend on everything else the process holds. These measurements are on torch 2.15.0+xpu only.
+
 ## Files
 
 | File | What it does |
@@ -159,3 +207,4 @@ Caveats:
 | `xpu_reductions.py` | The workaround for sum and mean; run directly, it measures before and after |
 | `foreach_norm_repro.py` | The gradient-norm bug |
 | `capture_gru.py` | Graph capture of a GRU loop, timed and checked against eager |
+| `allocation_cost.py` | Eager and replayed step time against the number of allocations held |
