@@ -255,10 +255,23 @@ So the pool is worth setting for any PyTorch XPU job, but it changes much only w
 operations dominate: recurrent loops, Python-level stepping, naive generation (4-14% there).
 Standard transformer training gains 1-3%, and llama.cpp, which manages its own memory, nothing.
 Even with the pool, the A770 is half as fast as the 3060 Ti on the recurrent model and in bf16
-training (its bf16 step is no faster than its fp32 step, which suggests the matrix units are not
-used on that path; not investigated), level in fp32, and four to five times slower at batch-1
-generation; its 16 GB fit the 124M training run that the 3060 Ti's 8 GB (with the desktop on it)
+training, level in fp32, and four to five times slower at batch-1 generation; its 16 GB fit the 124M training run that the 3060 Ti's 8 GB (with the desktop on it)
 did not.
+
+Why bf16 training is no faster than fp32 on the A770: the matrix units are used, but small
+products are slow. Square products `a @ b`, TFLOPS:
+
+| n | A770 fp32 | A770 bf16 | 3060 Ti fp32 | 3060 Ti bf16 |
+|---|---|---|---|---|
+| 512 | 3.9 | 6.0 | 6.5 | 20.3 |
+| 1,024 | 14.6 | 34.6 | 9.2 | 26.9 |
+| 2,048 | 14.5 | 78.9 | 9.9 | 33.9 |
+| 8,192 | 17.3 | 97.2 | 12.7 | 33.7 |
+
+From n = 2,048 the A770's bf16 products run 2.3 to 2.9 times the 3060 Ti's; at n = 512 they run
+3.4 times slower. The small GPT's products (4,096 rows by 384 to 1,536 columns) sit in that weak
+range. fp16 matches bf16 on both cards; the 3060 Ti's fp32 column is without TF32 (PyTorch's
+default).
 
 ## Files
 
