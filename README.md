@@ -4,7 +4,8 @@ These notes come from training recurrent models on an Arc A770 (16 GB) with PyTo
 backend. Two bugs give silently wrong gradients in ordinary training code. Neither raises an
 error or a warning, and each has a workaround of a few lines. The third section shows how to
 turn on graph capture (`torch.xpu.XPUGraph`), which the card refuses by default. The fourth
-shows that every device allocation a process holds makes each eager operation slower.
+shows that every device allocation a process holds makes each eager operation slower, how to
+remove that cost with one environment variable, and which workloads it matters for.
 
 Measured on torch 2.15.0+xpu and the 2.16.0.dev20261102+xpu nightly, intel-compute-runtime
 26.35.39758, Linux 7.2. Every number below comes from the scripts in this folder, run on that
@@ -228,6 +229,37 @@ figure, as much as between two runs without it. PyTorch's own segment count is u
 it counts what PyTorch asked for, not what the driver holds. The slab size and the 64 MiB limit
 were chosen to cover the segment sizes, not tuned.
 
+### Where the pool helps, and against an RTX 3060 Ti
+
+The gain depends on how many eager operations a job dispatches per unit of work. Measured with
+the pool off, on, then off again (the second pass checks for drift; it matched the first within
+the ranges below), and once on an RTX 3060 Ti (8 GB) in the same machine. `gpt_bench.py` is a
+plain pre-norm transformer in PyTorch: "small" is 6 layers of width 384, context 256, batch 16;
+"124M" is 12 layers of width 768, context 512, batch 8; generation is batch 1 with no key-value
+cache. The recurrent model is the one above. llama.cpp is a SYCL build running `llama-bench` on
+a 9B model at Q4_K.
+
+| Measurement | A770, pool off | A770, pool on | RTX 3060 Ti |
+|---|---|---|---|
+| Recurrent model, training step, loops recorded | 3.3-3.8 s | 1.12 s | 0.57 s |
+| Recurrent model, training step, eager | 17.2-19.3 s | 2.96 s | 0.66 s |
+| GPT small, training step, fp32 | 0.055 s | 0.053 s | 0.056 s |
+| GPT small, training step, bf16 autocast | 0.058-0.059 s | 0.058 s | 0.029 s |
+| GPT 124M, training step, bf16 autocast | 0.252-0.253 s | 0.250 s | out of memory |
+| GPT small, generation | 135-138 tokens/s | 144 | 748 |
+| GPT 124M, generation, bf16 | 54.6 tokens/s | 62.5 | 240 |
+| llama.cpp, prompt of 512 tokens | 1,507-1,518 tokens/s | 1,515 | not run |
+| llama.cpp, generating 128 tokens | 26.8-27.0 tokens/s | 26.8 | not run |
+
+So the pool is worth setting for any PyTorch XPU job, but it changes much only where small eager
+operations dominate: recurrent loops, Python-level stepping, naive generation (4-14% there).
+Standard transformer training gains 1-3%, and llama.cpp, which manages its own memory, nothing.
+Even with the pool, the A770 is half as fast as the 3060 Ti on the recurrent model and in bf16
+training (its bf16 step is no faster than its fp32 step, which suggests the matrix units are not
+used on that path; not investigated), level in fp32, and four to five times slower at batch-1
+generation; its 16 GB fit the 124M training run that the 3060 Ti's 8 GB (with the desktop on it)
+did not.
+
 ## Files
 
 | File | What it does |
@@ -237,3 +269,4 @@ were chosen to cover the segment sizes, not tuned.
 | `foreach_norm_repro.py` | The gradient-norm bug |
 | `capture_gru.py` | Graph capture of a GRU loop, timed and checked against eager |
 | `allocation_cost.py` | Eager and replayed step time against the number of allocations held |
+| `gpt_bench.py` | A plain GPT's training and generation timings on one card (`xpu` or `cuda`) |
