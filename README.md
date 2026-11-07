@@ -199,6 +199,35 @@ Two practical consequences: keep the number of live allocations low (few large t
 than many small ones, one shared pool for all recordings), and expect eager timings on this card
 to depend on everything else the process holds. These measurements are on torch 2.15.0+xpu only.
 
+### Fix: let the Level Zero adapter pool the allocations
+
+The cost is per driver allocation, not per PyTorch segment, and the Unified Runtime's Level
+Zero adapter can pool device allocations below PyTorch. `UR_L0_USM_ALLOCATOR` sets its pool
+(the v2 adapter, `SYCL_UR_USE_LEVEL_ZERO_V2=1`, reads it); the format is
+`EnableBuffers;[MaxPoolSize;]device:MaxPoolableSize,Capacity,SlabMinSize`, and
+`UR_L0_USM_ALLOCATOR_TRACE=1` prints the parameters it took. With
+
+```bash
+export UR_L0_USM_ALLOCATOR="1;device:64M,4,256M"
+```
+
+allocations up to 64 MiB, which covers the caching allocator's 2 MiB and 20 MiB segments, come
+from 256 MiB slabs, and `allocation_cost.py` no longer slows down with the memory held:
+
+| Extra memory held | Default, microseconds per step | Pooled |
+|---|---|---|
+| none | 167 | 160 |
+| 1,000 tensors of 1 MiB | 779 | 165 |
+| 4,000 tensors of 1 MiB | 3,510 | 172 |
+| 3.91 GiB in one tensor | 169 | 167 |
+
+On the recurrent model above (about 580 segments, recorded loops), a training step went from
+3.6 s to 1.1 s and recording from 24 s to 9 s. Losses over six training steps were equal to the
+last printed digit with and without the pool; gradient norms differed in the seventh significant
+figure, as much as between two runs without it. PyTorch's own segment count is unchanged, since
+it counts what PyTorch asked for, not what the driver holds. The slab size and the 64 MiB limit
+were chosen to cover the segment sizes, not tuned.
+
 ## Files
 
 | File | What it does |
