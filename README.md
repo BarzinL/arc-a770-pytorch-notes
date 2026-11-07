@@ -1,4 +1,4 @@
-# Training on an Intel Arc A770 with PyTorch XPU: two wrong-result bugs, graph capture, the cost of allocations, and direct submission
+# Training on an Intel Arc A770 with PyTorch XPU: two wrong-result bugs, graph capture, and making it faster below the model
 
 These notes come from training recurrent models on an Arc A770 (16 GB) with PyTorch's XPU
 backend. Two bugs give silently wrong gradients in ordinary training code. Neither raises an
@@ -7,9 +7,11 @@ turn on graph capture (`torch.xpu.XPUGraph`), which the card refuses by default.
 shows that every device allocation a process holds makes each eager operation slower, how to
 remove that cost with one environment variable, and which workloads it matters for. The fifth
 turns on the compute runtime's direct submission, off by default on this card, which cuts the
-cost of every kernel launch and speeds up everything measured here, llama.cpp included.
+cost of every kernel launch and speeds up everything measured here, llama.cpp included. The sixth
+compares the `xe` kernel driver with i915. The seventh covers a cast fix in current PyTorch
+nightlies and what attention kernels this card has.
 
-Measured on torch 2.15.0+xpu and the 2.16.0.dev20261102+xpu nightly, intel-compute-runtime
+Measured on torch 2.15.0+xpu and the 2.16.0.dev20261102 and 2.16.0.dev20261106 +xpu nightlies, intel-compute-runtime
 26.35.39758, Linux 7.2. Every number below comes from the scripts in this folder, run on that
 card. The results are the same on both torch versions unless a table says otherwise.
 
@@ -331,6 +333,78 @@ training of small models is 1.4 times slower instead of 2. Batch-1 generation is
 2.8 times slower, and a 64×64 product's kernel still takes about 11 µs against a launch floor now
 under 1 µs, so small matrix kernels are what is left.
 
+## 6. The `xe` kernel driver
+
+The A770 runs under either of Linux's Intel drivers. Binding it to `xe` instead of `i915` takes
+three kernel parameters (the device id is the A770's; `probe_display=0` because this card drives
+no display here):
+
+```
+i915.force_probe=!56a0 xe.force_probe=56a0 xe.probe_display=0
+```
+
+Same kernel (7.2.14), same scripts, the pool and direct submission on in both columns, two
+passes each:
+
+| Measure | i915 | xe |
+|---|---|---|
+| empty kernel, host time per launch (regular command lists) | 4.0-4.1 µs | 2.8-3.1 µs |
+| empty kernel, on the card | 1.04 µs | 1.04 µs |
+| recurrent model, training step, loops recorded | 0.661-0.671 s | 0.650-0.651 s |
+| recurrent model, training step, eager | 1.035-1.039 s | 0.927-0.933 s |
+| GPT small, generation, fp32 | 282 tokens/s | 306-307 |
+| GPT small / 124M, training step, bf16 | 0.0414 / 0.223 s | 0.0408 / 0.222 s |
+| llama.cpp SYCL, prompt of 512 / generating 128 | 1,562-1,587 / 39.3-39.7 tokens/s | 1,592-1,593 / 41.5 |
+| llama.cpp Vulkan, prompt of 512 / generating 128 | 678-780 / 42.4-43.8 tokens/s | 711-769 / 43.2-43.7 |
+| oneDNN and oneMKL matrix kernels, 64 to 4,096 | equal within 2% | |
+
+`xe` takes about a quarter off the host's cost per launch and leaves the card's time alone: work
+bound by launches gains 5-10%, work bound by the card is unchanged, and Mesa's Vulkan driver runs as
+before. Nothing measured was slower, and the graph-capture test passes. This is a few hours of use,
+not a stability record.
+
+## 7. Casts at half bandwidth, fixed in nightlies; attention
+
+Profiling the small GPT's bf16 training step by operation on both cards (torch.profiler) showed the
+A770 spending 12.3 ms per step in `aten::copy_` against 2.8 ms on the 3060 Ti, most of it
+autocast's float32 <-> bfloat16 casts. On torch 2.15 those run as a non-vectorized elementwise
+kernel. `cast_bandwidth.py`, 6.3M elements, GB/s read plus written:
+
+| Case | A770, torch 2.15 | A770, nightly 2.16.0.dev20261106 | RTX 3060 Ti |
+|---|---|---|---|
+| copy fp32 | 440-446 | 444 | 408 |
+| cast fp32 -> bf16 | 207 | 436 | 409 |
+| cast bf16 -> fp32 | 190 | 452 | 402 |
+| make a transposed fp32 view contiguous | 222 | 223 | 405 |
+
+torch-xpu-ops vectorized these casts on 2026-10-26 ("Vectorize fp32 <-> 16-bit float copy",
+intel/torch-xpu-ops#5806), and PyTorch's pin took the change on 2026-11-04, so XPU nightlies from
+2026-11-05 have it. `gpt_bench.py` on the nightly, same losses:
+
+| Workload | torch 2.15 | nightly | RTX 3060 Ti |
+|---|---|---|---|
+| GPT small, training step, bf16 | 0.0409 s | 0.0347 s | 0.029 s |
+| GPT 124M, training step, bf16 | 0.222 s | 0.195 s | out of memory |
+| GPT 124M, generation, bf16 | 99.7 tokens/s | 139.3-148.0 | 240 |
+
+fp32 work is unchanged. Both wrong-result bugs (sections 1 and 2) are still present in the nightly,
+and graph capture works there. Copies from a strided source (the last row above) are still at half
+bandwidth on both versions.
+
+Attention, `sdpa_backends.py` (the small GPT's causal attention, bf16, forward and backward):
+
+| Backend | RTX 3060 Ti | A770, torch 2.15 | A770, nightly |
+|---|---|---|---|
+| math | 2,241 µs | 2,072 µs | 1,700 µs |
+| flash | 299 µs | no kernel | no kernel |
+| efficient | 298 µs | 1,938 µs, equal to math to the bit | 1,605 µs, equal to math |
+
+There is no fused attention for training on the A770. torch-xpu-ops' flash attention is built only
+for Data Center GPU Max and Battlemage (`-device pvc,bmg`), uses 2D block loads that this
+generation lacks, and checks the architecture at run time. For inference (no gradients) a fused
+kernel does exist, through oneDNN's graph API, 8 to 12 times faster than math, and PyTorch selects it
+by itself.
+
 ## Files
 
 | File | What it does |
@@ -342,3 +416,5 @@ under 1 µs, so small matrix kernels are what is left.
 | `allocation_cost.py` | Eager and replayed step time against the number of allocations held |
 | `gpt_bench.py` | A plain GPT's training and generation timings on one card (`xpu` or `cuda`) |
 | `kernel_floor.cpp` | The launch floor: an empty kernel and small adds, timed on the card and on the host (SYCL) |
+| `cast_bandwidth.py` | Bandwidth of dtype casts and copies on one card |
+| `sdpa_backends.py` | Which attention backends run forward and backward, how fast, and against math |
