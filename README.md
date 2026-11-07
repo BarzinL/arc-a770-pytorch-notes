@@ -1,11 +1,13 @@
-# Training on an Intel Arc A770 with PyTorch XPU: two wrong-result bugs, graph capture, and the cost of allocations
+# Training on an Intel Arc A770 with PyTorch XPU: two wrong-result bugs, graph capture, the cost of allocations, and direct submission
 
 These notes come from training recurrent models on an Arc A770 (16 GB) with PyTorch's XPU
 backend. Two bugs give silently wrong gradients in ordinary training code. Neither raises an
 error or a warning, and each has a workaround of a few lines. The third section shows how to
 turn on graph capture (`torch.xpu.XPUGraph`), which the card refuses by default. The fourth
 shows that every device allocation a process holds makes each eager operation slower, how to
-remove that cost with one environment variable, and which workloads it matters for.
+remove that cost with one environment variable, and which workloads it matters for. The fifth
+turns on the compute runtime's direct submission, off by default on this card, which cuts the
+cost of every kernel launch and speeds up everything measured here, llama.cpp included.
 
 Measured on torch 2.15.0+xpu and the 2.16.0.dev20261102+xpu nightly, intel-compute-runtime
 26.35.39758, Linux 7.2. Every number below comes from the scripts in this folder, run on that
@@ -273,6 +275,62 @@ From n = 2,048 the A770's bf16 products run 2.3 to 2.9 times the 3060 Ti's; at n
 range. fp16 matches bf16 on both cards; the 3060 Ti's fp32 column is without TF32 (PyTorch's
 default).
 
+## 5. Direct submission: the cost of every launch
+
+With the pool in place, the A770 was still slow wherever work comes in many small kernels.
+`kernel_floor.cpp` (SYCL, built with oneAPI's `icpx`) times an empty kernel and small adds,
+on the card (from profiling events) and on the host (back-to-back launches). By default an
+empty kernel takes 2.3 µs on the card and 14-15 µs of host time per launch with immediate
+command lists, which is what PyTorch's graph capture needs (3.7-4.9 µs with regular ones). A
+64×64 matrix product took 11 µs on the card in both oneDNN and oneMKL, and 25-36 µs of host
+time per call.
+
+The compute runtime can write work into the card's ring buffer itself instead of making one
+system call to the kernel driver per submission. It does this by default on some platforms, but
+not on the A770 under the i915 kernel driver here. Turn it on with two variables (the first
+makes the runtime read the second; `PrintDebugSettings=1` confirms it was read):
+
+```bash
+export NEOReadDebugKeys=1 EnableDirectSubmission=1
+```
+
+| Measure | Without | With |
+|---|---|---|
+| empty kernel, host time per launch (immediate lists) | 14.1-14.6 µs | 2.5-3.3 µs |
+| empty kernel, on the card | 2.3 µs | 0.6-0.7 µs |
+| add of 4,096 elements, on the card | 4.6 µs | 1.1 µs |
+
+The same workloads as section 4, with the pool on in both columns, two passes each way,
+alternating:
+
+| Workload | Without | With | RTX 3060 Ti |
+|---|---|---|---|
+| PyTorch: tiny add / add of 1M / 64×64 matmul, per call | 18-19 / 35 / 46-48 µs | 5.0-5.3 / 4.8-5.1 / 25-27 µs | 6.9 / 24.8 / 13.9 µs |
+| Recurrent model, training step, loops recorded | 0.79-0.80 s | 0.67-0.68 s | 0.57 s |
+| Recurrent model, training step, eager | 2.64-2.71 s | 1.04-1.07 s | 0.63 s |
+| GPT small, training step, fp32 | 0.0533-0.0535 s | 0.0438-0.0440 s | 0.0558 s |
+| GPT small, training step, bf16 autocast | 0.0574-0.0575 s | 0.0412-0.0414 s | 0.0290 s |
+| GPT 124M, training step, bf16 autocast | 0.250 s | 0.223 s | out of memory |
+| GPT small, generation | 142-152 tokens/s | 264-286 | 748 |
+| GPT 124M, generation, bf16 | 62-63 tokens/s | 100 | 240 |
+| llama.cpp (SYCL), prompt of 512 tokens | 1,516-1,517 tokens/s | 1,605-1,606 | not run |
+| llama.cpp (SYCL), generating 128 tokens | 26.9 tokens/s | 40.2 | not run |
+
+(The recurrent model's recorded step is 0.79 s rather than section 4's 1.12 s because one more
+of its loops is now recorded; both columns here include that.)
+
+Results are unchanged: six training steps give the same losses to the last printed digit with
+and without it, and gradient norms agree to the seventh significant figure, as between two runs
+without it. Idle power is unchanged (28.6 W from the card's own energy counter in hwmon, with no process, with an
+idle process, with or without direct submission), and there was no hang in about forty minutes
+of mixed work. llama.cpp's Vulkan backend goes through Mesa and is not affected; the variables
+apply to SYCL and Level Zero programs only.
+
+With both settings, the A770 trains the small GPT in fp32 faster than the 3060 Ti, and bf16
+training of small models is 1.4 times slower instead of 2. Batch-1 generation is still 2.4 to
+2.8 times slower, and a 64×64 product's kernel still takes about 11 µs against a launch floor now
+under 1 µs, so small matrix kernels are what is left.
+
 ## Files
 
 | File | What it does |
@@ -283,3 +341,4 @@ default).
 | `capture_gru.py` | Graph capture of a GRU loop, timed and checked against eager |
 | `allocation_cost.py` | Eager and replayed step time against the number of allocations held |
 | `gpt_bench.py` | A plain GPT's training and generation timings on one card (`xpu` or `cuda`) |
+| `kernel_floor.cpp` | The launch floor: an empty kernel and small adds, timed on the card and on the host (SYCL) |
